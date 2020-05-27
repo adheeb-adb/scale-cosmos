@@ -1,0 +1,105 @@
+public static class ScaleCosmosDB
+    {
+        private static DocumentClient _client;
+        private static DbInfo _dbInfo;
+
+        private static DocumentClient GetDocumentClient(IServiceProvider service)
+        {
+            if (_client == null)
+            {
+                _dbInfo = service.GetRequiredService<DbInfo>();
+                _client = new DocumentClient(new Uri(_dbInfo.ServiceEndpoint), _dbInfo.SasKey);
+            }
+
+            return _client;
+        }
+
+        [FunctionName("ScaleCosmosDB")]
+        public static async Task<IActionResult> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            ILogger log,
+            [Inject]IServiceProvider rootServiceProvider,
+            ExecutionContext context)
+        {
+            using (var scope = rootServiceProvider.CreateScope())
+            {
+                var service = scope.ServiceProvider;
+
+                // Get MIN_RU, MAX_RU from local.settings.json
+                var config = new ConfigurationBuilder().SetBasePath(context.FunctionAppDirectory)
+                    .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
+
+                var scaleConstants = config.GetSection("ScaleConstants");
+
+                // Get querystring parameters
+                int changeRu = Convert.ToInt32(req.Query["changeRu"]);
+                string operationType = req.Query["operationType"];
+                string containerId = req.Query["containerId"];
+                var client = GetDocumentClient(service);
+                Offer offer;
+                string message = string.Empty;
+
+                if (!string.IsNullOrWhiteSpace(containerId))
+                {
+                    string selfLink = client.CreateDocumentCollectionQuery(
+                                    UriFactory.CreateDatabaseUri(_dbInfo.DatabaseId))
+                                        .Where(c => c.Id == containerId)
+                                        .AsEnumerable()
+                                        .FirstOrDefault()
+                                        .SelfLink;
+                    offer = client.CreateOfferQuery().Where(r => r.ResourceLink == selfLink).AsEnumerable().SingleOrDefault();
+                }
+                else
+                {
+                    offer = client.CreateOfferQuery().AsEnumerable().FirstOrDefault();
+                }
+
+                if (offer != null)
+                {
+                    int currentRu = (int)offer.GetPropertyValue<JObject>("content").GetValue("offerThroughput");
+                    log.LogInformation(string.Format("Current provisioned throughput is: {0} RU", currentRu));
+
+                    int newThroughput = 0;
+
+                    int maxRu = Convert.ToInt32(scaleConstants["MAX_RU"]);
+                    int minRu = Convert.ToInt32(scaleConstants["MIN_RU"]);
+
+                    switch (operationType.Trim().ToUpper())
+                    {
+                        case "ABSOLUTE":
+                            newThroughput = changeRu;
+                            break;
+                        case "INCREMENT":
+                            newThroughput = currentRu + changeRu;
+                            break;
+                        case "DECREMENT":
+                            newThroughput = currentRu - changeRu;
+                            break;
+                    }
+
+                    if (newThroughput >= minRu && newThroughput <= maxRu)
+                    {
+                        offer = new OfferV2(offer, newThroughput);
+
+                        await client.ReplaceOfferAsync(offer);
+
+                        message = $"The collection's throughput was changed. Current throughput is {newThroughput} RU";
+                        log.LogInformation(message);
+                        return new OkObjectResult(message);
+                    }
+                    else
+                    {
+                        message = $"Throughput limit error! Current throughput: {currentRu} RU. Througput range: {minRu} - {maxRu}. Requested change: {newThroughput} RU";
+                        log.LogError(message);
+                        return new BadRequestObjectResult(message);
+                    }
+                }
+
+                message = "No offer found!";
+                log.LogError(message);
+                return new NotFoundObjectResult(message);
+            }
+        }
+    }
